@@ -1,0 +1,17 @@
+# 编译产物（可由 make 重新生成，不进仓库）
+bin/
+obj/
+*.o
+*.d
+*.img
+*.bin
+
+# 编辑器 / 系统生成文件
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# 凭据，绝对不能提交
+.env
+*.key
