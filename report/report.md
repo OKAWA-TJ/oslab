@@ -27,7 +27,7 @@
 1. 理解 RISC-V 上最小可执行内核的启动流程：从机器加电、OpenSBI 固件初始化到内核接管控制权的完整过程。
 2. 使用**链接脚本**描述内核的内存布局，理解入口点（`kern_entry`）、代码/数据/BSS 各段如何被安排到约定地址（`0x80200000`）。
 3. 使用**交叉编译**（`riscv64-unknown-elf-*` 工具链）生成 ELF 可执行文件，并进一步生成内核镜像（`ucore.img`）。
-4. 使用 **OpenSBI** 作为 bootloader 加载内核镜像，并用 QEMU 模拟 64 位 RISC-V 计算机运行内核。
+4. 使用 QEMU 预加载内核镜像，由 **OpenSBI** 完成初始化并移交控制权，在模拟的 64 位 RISC-V 计算机上运行内核。
 5. 使用 OpenSBI 提供的服务在屏幕上格式化打印字符串（`(THU.CST) os is loading ...`），作为后续调试的基础。
 6. 学习使用 **GDB 远程调试**内核，并借助 AI 辅助完成操作系统开发。
 
@@ -39,7 +39,7 @@
 |------|------------|---------|------|
 | 2411590-李幸之 | DeepSeek Harness（DSH，终端 Agent） | DeepSeek Flash（`deepseek-V41-flash`） | WSL2 / Ubuntu（Linux 6.18.33.2），工具链 `riscv64-unknown-elf-*`，QEMU `qemu-system-riscv64` |
 | 2411839-侯大川 | Claude Code（VS Code 扩展，终端 Agent） | DeepSeek V4 Pro（`deepseek-v4-pro`） | WSL2 / Ubuntu（Linux 6.18.33.2），工具链 `riscv64-unknown-elf-*`，QEMU `qemu-system-riscv64` |
-| 2411207-孙曌宣 | Codex（桌面版） | GPT-6 | Ubuntu 25.10（Linux 6.17.0-41-generic，x86_64）；RISC-V GCC 10.2.0、GDB 10.1、QEMU 7.0.0 |
+| 2411207-孙曌宣 | Codex（桌面版） | GPT-6 | Ubuntu 25.10（Linux 6.17.0-41-generic，x86_64）；RISC-V GCC 10.2.0、GDB 10.1、QEMU 4.1.1（OpenSBI v0.4） |
 
 **说明：**
 - **AI 编程工具**：Claude Code 作为终端 Agent，在 VS Code 扩展环境中运行。
@@ -54,7 +54,7 @@
 本章围绕「**让一个最小内核在 RISC-V 上跑起来并打印一句话**」这一核心主题展开，解决的核心问题是：**如何让一段裸机程序从「机器加电」走到「能运行 C 代码」**。整章是一条自上而下、层层交接的链路：
 
 ```
-机器加电 → OpenSBI 固件（0x1000 复位）→ 加载内核到 0x80200000 → 内核入口 kern_entry
+机器加电 → QEMU 复位 ROM（0x1000）→ OpenSBI（0x80000000）→ 预加载于 0x80200000 的内核入口 kern_entry
         → 建栈（la sp, bootstacktop）→ 进 C（tail kern_init）→ 清 BSS、打印、死循环
 ```
 
@@ -148,19 +148,19 @@ $sp = 0x80203000      # = bootstacktop，内核自己的启动栈顶
 
 **Q1：RISC-V 硬件加电后最初执行的几条指令位于什么地址？**
 
-复位向量地址 **`0x1000`**。加电后 `pc` 从 `0x1000` 开始取指，这里放的是固件（OpenSBI 的 `fw_dynamic` 入口）的启动跳板代码。
+复位向量地址 **`0x1000`**。加电后 `pc` 从 `0x1000` 开始取指，这里是 QEMU 复位 ROM 的启动跳板；随后才进入 `0x80000000` 的 OpenSBI 固件。
 
 **Q2：它们主要完成了哪些功能？**
 
 | 指令 | 功能 |
 | --- | --- |
-| `auipc t0,0x0` | `t0 = 当前 PC(0x1000)`，用 PC 相对寻址取得固件自身加载基址 |
-| `addi a1,t0,32` | `a1 = 0x1020`，指向固件动态信息结构体 `fw_dynamic_info`，作为参数传递 |
+| `auipc t0,0x0` | `t0 = 当前 PC(0x1000)`，取得复位 ROM 中的基址 |
+| `addi a1,t0,32` | `a1 = 0x1020`，指向设备树（FDT），作为参数传给 OpenSBI |
 | `csrr a0,mhartid` | `a0 = mhartid`，读当前硬件线程（hart）ID，作为参数 |
-| `ld t0,24(t0)` | 从 `0x1018` 读出 `next_addr`（下一阶段入口地址） |
+| `ld t0,24(t0)` | 从 `0x1018` 读出 OpenSBI 入口地址 `0x80000000` |
 | `jr t0` | 跳转到该入口，开始 OpenSBI 主体初始化 |
 
-即这 5 条指令完成了「定位自身 → 准备参数（hart id、固件信息指针）→ 读取下一阶段入口 → 跳转」，把执行流交给 OpenSBI 主初始化，最终 OpenSBI 跳转到 `0x80200000` 将控制权移交给内核。
+即这 5 条指令完成了「定位复位 ROM → 准备参数（hart id、设备树指针）→ 读取 OpenSBI 入口 → 跳转」，把执行流交给 OpenSBI 主初始化，最终 OpenSBI 跳转到 `0x80200000` 将控制权移交给内核。
 
 **补充观察：** 本实验用 `-device loader,file=bin/ucore.img,addr=0x80200000` 把内核在 QEMU 复位前就预加载到 `0x80200000`，因此复位那一刻该地址就已是内核代码，`watch *0x80200000` 观察不到「内核被加载的瞬间」；用 `b *0x80200000` 打断点是更可靠的验证方式。
 
