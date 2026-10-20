@@ -3,7 +3,153 @@
 #include <best_fit_pmm.h>
 #include <stdio.h>
 
-//lab2 function2-2 YOUR CODE
+//lab2 function2-2 2411839
+// Best-Fit 连续物理内存分配器。
+//
+// 与 First-Fit（default_pmm.c）的区别仅在于分配策略：分配 n 页时，
+// First-Fit 选择第一个 property >= n 的空闲块，而 Best-Fit 遍历整个
+// 空闲链表，选择其中 property >= n 且 property 最小（即最贴合）的空闲块，
+// 从而尽可能减少分配后残留的碎片。
+//
+// 内部状态约定（与测试函数保持一致）：
+//   - 空闲块用 free_area_t + 双向链表组织，每个空闲块由首地址对应的
+//     Page 作为链表节点，其 property 表示该空闲块的连续页数；
+//   - 链表按 Page 地址升序排列，释放时与前后相邻空闲块合并。
+
+static free_area_t free_area;
+
+#define free_list (free_area.free_list)
+#define nr_free (free_area.nr_free)
+
+// best_fit_init - 初始化空闲链表与空闲页计数
+static void
+best_fit_init(void) {
+    list_init(&free_list);
+    nr_free = 0;
+}
+
+// best_fit_init_memmap - 把 [base, base + n) 这段连续物理页登记为一个空闲块
+static void
+best_fit_init_memmap(struct Page *base, size_t n) {
+    assert(n > 0);
+    struct Page *p = base;
+    for (; p != base + n; p++) {
+        assert(PageReserved(p));
+        p->flags = p->property = 0;
+        set_page_ref(p, 0);
+    }
+    base->property = n;
+    SetPageProperty(base);
+    nr_free += n;
+    if (list_empty(&free_list)) {
+        list_add(&free_list, &(base->page_link));
+    } else {
+        // 保持空闲链表按地址升序排列
+        list_entry_t *le = &free_list;
+        while ((le = list_next(le)) != &free_list) {
+            struct Page *page = le2page(le, page_link);
+            if (base < page) {
+                list_add_before(le, &(base->page_link));
+                break;
+            } else if (list_next(le) == &free_list) {
+                list_add(le, &(base->page_link));
+            }
+        }
+    }
+}
+
+// best_fit_alloc_pages - 分配 n 个连续物理页（Best-Fit：选最贴合的空闲块）
+static struct Page *
+best_fit_alloc_pages(size_t n) {
+    assert(n > 0);
+    if (n > nr_free) {
+        return NULL;
+    }
+    struct Page *page = NULL;
+    list_entry_t *le = &free_list;
+    while ((le = list_next(le)) != &free_list) {
+        struct Page *p = le2page(le, page_link);
+        // 在 property >= n 的空闲块中，记录 property 最小的那一个
+        if (p->property >= n &&
+            (page == NULL || p->property < page->property)) {
+            page = p;
+        }
+    }
+    if (page != NULL) {
+        list_entry_t *prev = list_prev(&(page->page_link));
+        list_del(&(page->page_link));
+        // 若该空闲块大于 n，把剩余部分作为新的空闲块插回原位置
+        if (page->property > n) {
+            struct Page *p = page + n;
+            p->property = page->property - n;
+            SetPageProperty(p);
+            list_add(prev, &(p->page_link));
+        }
+        nr_free -= n;
+        ClearPageProperty(page);
+    }
+    return page;
+}
+
+// best_fit_free_pages - 释放 n 个连续物理页，并与相邻空闲块合并
+static void
+best_fit_free_pages(struct Page *base, size_t n) {
+    assert(n > 0);
+    struct Page *p = base;
+    for (; p != base + n; p++) {
+        assert(!PageReserved(p) && !PageProperty(p));
+        p->flags = 0;
+        set_page_ref(p, 0);
+    }
+    base->property = n;
+    SetPageProperty(base);
+    nr_free += n;
+
+    // 按地址升序插入空闲链表
+    if (list_empty(&free_list)) {
+        list_add(&free_list, &(base->page_link));
+    } else {
+        list_entry_t *le = &free_list;
+        while ((le = list_next(le)) != &free_list) {
+            struct Page *page = le2page(le, page_link);
+            if (base < page) {
+                list_add_before(le, &(base->page_link));
+                break;
+            } else if (list_next(le) == &free_list) {
+                list_add(le, &(base->page_link));
+            }
+        }
+    }
+
+    // 尝试与前一个空闲块合并
+    list_entry_t *le = list_prev(&(base->page_link));
+    if (le != &free_list) {
+        p = le2page(le, page_link);
+        if (p + p->property == base) {
+            p->property += base->property;
+            ClearPageProperty(base);
+            list_del(&(base->page_link));
+            base = p;
+        }
+    }
+
+    // 尝试与后一个空闲块合并
+    le = list_next(&(base->page_link));
+    if (le != &free_list) {
+        p = le2page(le, page_link);
+        if (base + base->property == p) {
+            base->property += p->property;
+            ClearPageProperty(p);
+            list_del(&(p->page_link));
+        }
+    }
+}
+
+// best_fit_nr_free_pages - 返回当前空闲物理页的数目
+static size_t
+best_fit_nr_free_pages(void) {
+    return nr_free;
+}
 
 // Framework tests: students must not modify basic_check or best_fit_check.
 static void
@@ -136,3 +282,14 @@ best_fit_check(void) {
     cprintf("grading: %d / %d points\n", score, sumscore);
     #endif
 }
+
+// best_fit_pmm_manager - Best-Fit 物理内存管理器注册结构
+const struct pmm_manager best_fit_pmm_manager = {
+    .name = "best_fit_pmm_manager",
+    .init = best_fit_init,
+    .init_memmap = best_fit_init_memmap,
+    .alloc_pages = best_fit_alloc_pages,
+    .free_pages = best_fit_free_pages,
+    .nr_free_pages = best_fit_nr_free_pages,
+    .check = best_fit_check,
+};
