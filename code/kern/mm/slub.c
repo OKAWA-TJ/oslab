@@ -5,7 +5,7 @@
 #include <stdio.h>
 #include <slub.h>
 
-//lab2 challenge 2411839
+//lab2 challenge
 // SLUB 分配器（简化实现）：体现「两层架构」的主体思想。
 //   第一层（页分配）：复用 pmm_manager 的 alloc_pages / free_pages 获取/归还整页；
 //   第二层（对象分配）：把整页（slab）切割成固定大小的对象，空闲对象通过

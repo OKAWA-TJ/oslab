@@ -4,7 +4,7 @@
 #include <stdio.h>
 #include <buddy_pmm.h>
 
-//lab2 function3 2411839
+//lab2 function3
 // Buddy System（伙伴系统）物理内存分配器。
 //
 // 核心思想：把可用内存划分为大小必须为 2 的幂（1, 2, 4, 8, ... 页）的存储块，

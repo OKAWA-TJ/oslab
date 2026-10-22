@@ -61,7 +61,7 @@ size_t nr_free_pages(void) {
     return pmm_manager->nr_free_pages();
 }
 
-//lab2 function1 2411839
+//lab2 function1
 /* page_init - 根据设备树探测到的物理内存信息建立 Page 描述符数组，
  * 并把内核镜像与描述符数组之后的空闲物理页交给当前物理内存管理器。
  * 要求：
