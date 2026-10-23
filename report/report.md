@@ -98,7 +98,7 @@
 **核心代码**（`kern/mm/pmm.c`，对应注释 `//lab2 function1`）：
 
 ```c
-//lab2 function1 2411839
+//lab2 function1
 static void page_init(void) {
     // 从设备树获取物理内存的起点与大小
     uint64_t mem_begin = get_memory_base();
@@ -198,7 +198,7 @@ Best-Fit 与 First-Fit 的区别**仅在分配策略**：分配 `n` 页时，不
 **核心代码**（`kern/mm/best_fit_pmm.c`，对应注释 `//lab2 function2-2`）：
 
 ```c
-//lab2 function2-2 2411839
+//lab2 function2-2
 static free_area_t free_area;
 
 #define free_list (free_area.free_list)
