@@ -1,0 +1,14 @@
+The target architecture is set to "riscv:rv64".
+0x0000000000001000 in ?? ()
+Breakpoint 1 at 0xffffffffc02000d6: file kern/init/init.c, line 30.
+
+Breakpoint 1, kern_init () at kern/init/init.c:30
+30	    memset(edata, 0, end - edata);
+
+===== [终端3 / riscv gdb] 停在内核 C 入口 kern_init =====
+PC   = $1 = 0xffffffffc02000d6
+satp = $2 = 0x8000000000080205
+=> 0xffffffffc02000d6 <kern_init>:	auipc	a0,0x6
+   0xffffffffc02000da <kern_init+4>:	addi	a0,a0,-190
+   0xffffffffc02000de <kern_init+8>:	auipc	a2,0x6
+[Inferior 1 (process 1) detached]

@@ -1,0 +1,58 @@
+Breakpoint 1 at 0x395740: file /opt/riscv/qemu-4.1.1/target/riscv/cpu_helper.c, line 158.
+Breakpoint 2 at 0x396112: file /opt/riscv/qemu-4.1.1/target/riscv/cpu_helper.c, line 472.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/x86_64-linux-gnu/libthread_db.so.1".
+[New Thread 0x7ffff77ff6c0 (LWP 7276)]
+[New Thread 0x7ffff4dff6c0 (LWP 7277)]
+
+OpenSBI v0.4 (Jul  2 2019 11:53:53)
+   ____                    _____ ____ _____
+  / __ \                  / ____|  _ \_   _|
+ | |  | |_ __   ___ _ __ | (___ | |_) || |
+ | |  | | '_ \ / _ \ '_ \ \___ \|  _ < | |
+ | |__| | |_) |  __/ | | |____) | |_) || |_
+  \____/| .__/ \___|_| |_|_____/|____/_____|
+        | |
+        |_|
+
+Platform Name          : QEMU Virt Machine
+Platform HART Features : RV64ACDFIMSU
+Platform Max HARTs     : 8
+Current Hart           : 0
+Firmware Base          : 0x80000000
+Firmware Size          : 112 KB
+Runtime SBI Version    : 0.1
+
+PMP0: 0x0000000080000000-0x000000008001ffff (A)
+PMP1: 0x0000000000000000-0xffffffffffffffff (A,R,W,X)
+[Switching to Thread 0x7ffff4dff6c0 (LWP 7277)]
+
+================ [HOST GDB] get_physical_address 入口 ================
+被翻译虚拟地址 addr   = 0xffffffffc02000d6
+satp 寄存器           = 0x8000000000080205   (MODE=8 即 Sv39, 根页表 PPN=0x80205)
+access_type           = 2  (0=LOAD 1=STORE 2=INST_FETCH)
+mmu_idx(特权级)       = 1  (1 = S-mode)
+
+--- 按 Sv39 公式手动算第一级索引 ---
+根页表物理基址 base = 0x80205000
+VPN[2] = (addr>>30)&0x1ff = 0x1ff
+PTE 物理地址 = base + VPN[2]*8 = 0x80205ff8
+
+--- 地址翻译调用栈 (call path) ---
+#0  get_physical_address (env=env@entry=0x55555630e9d0, physical=physical@entry=0x7ffff4dfe300, prot=prot@entry=0x7ffff4dfe2fc, addr=addr@entry=18446744072637907158, access_type=access_type@entry=2, mmu_idx=mmu_idx@entry=1) at /opt/riscv/qemu-4.1.1/target/riscv/cpu_helper.c:158
+#1  0x00005555558e9fdb in riscv_cpu_tlb_fill (cs=0x555556305fc0, address=18446744072637907158, size=0, access_type=MMU_INST_FETCH, mmu_idx=1, probe=false, retaddr=0) at /opt/riscv/qemu-4.1.1/target/riscv/cpu_helper.c:451
+#2  0x000055555586a944 in tlb_fill (cpu=cpu@entry=0x555556305fc0, addr=addr@entry=18446744072637907158, size=size@entry=0, access_type=access_type@entry=MMU_INST_FETCH, mmu_idx=mmu_idx@entry=1, retaddr=retaddr@entry=0) at /opt/riscv/qemu-4.1.1/accel/tcg/cputlb.c:878
+#3  0x000055555586de41 in get_page_addr_code (env=0x55555630e9d0, addr=addr@entry=18446744072637907158) at /opt/riscv/qemu-4.1.1/include/exec/cpu-all.h:404
+#4  0x0000555555887e26 in tb_htable_lookup (cpu=cpu@entry=0x555556305fc0, pc=pc@entry=18446744072637907158, cs_base=cs_base@entry=0, flags=flags@entry=24577, cf_mask=4278714368) at /opt/riscv/qemu-4.1.1/accel/tcg/cpu-exec.c:339
+#5  0x0000555555883098 in tb_lookup__cpu_state (cpu=<optimized out>, pc=<synthetic pointer>, cs_base=<synthetic pointer>, flags=<synthetic pointer>, cf_mask=<optimized out>) at /opt/riscv/qemu-4.1.1/include/exec/tb-lookup.h:43
+#6  helper_lookup_tb_ptr (env=0x55555630e9d0) at /opt/riscv/qemu-4.1.1/accel/tcg/tcg-runtime.c:154
+#7  0x00007ffff4e50df7 in code_gen_buffer ()
+#8  0x0000555555887b08 in cpu_tb_exec (cpu=cpu@entry=0x555556305fc0, itb=0x7ffff4e50d00 <code_gen_buffer+330963>) at /opt/riscv/qemu-4.1.1/accel/tcg/cpu-exec.c:173
+#9  0x00005555558885dd in cpu_loop_exec_tb (cpu=0x555556305fc0, tb=<optimized out>, last_tb=<synthetic pointer>, tb_exit=<synthetic pointer>) at /opt/riscv/qemu-4.1.1/accel/tcg/cpu-exec.c:621
+
+================ [HOST GDB] tlb_set_page 前 (翻译结果) ================
+虚地址 address (vaddr) 与翻译出的物理地址 pa、权限 prot:
+$1 = 0xffffffffc02000d6
+$2 = 0x80200000
+$3 = 0x7
+随后 riscv_cpu_tlb_fill 用 tlb_set_page(cs, vaddr, pa, prot, ...) 写入软 TLB

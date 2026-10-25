@@ -1,0 +1,71 @@
+[sudo: authenticate] Password: 
+[New LWP 8259]
+[New LWP 8258]
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/x86_64-linux-gnu/libthread_db.so.1".
+__syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+warning: 56	../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S: No such file or directory
+
+===== [终端2 / host gdb] 已 attach 到 QEMU 进程 =====
+list get_physical_address 源码, 证明调试符号可用:
+155	static int get_physical_address(CPURISCVState *env, hwaddr *physical,
+156	                                int *prot, target_ulong addr,
+157	                                int access_type, int mmu_idx)
+158	{
+159	    /* NOTE: the env->pc value visible here will not be
+160	     * correct, but the value visible to the exception handler
+161	     * (riscv_cpu_do_interrupt) is correct */
+162	
+163	    int mode = mmu_idx;
+164	
+165	    if (mode == PRV_M && access_type != MMU_INST_FETCH) {
+166	        if (get_field(env->mstatus, MSTATUS_MPRV)) {
+167	            mode = get_field(env->mstatus, MSTATUS_MPP);
+168	        }
+169	    }
+170	
+171	    if (mode == PRV_M || !riscv_feature(env, RISCV_FEATURE_MMU)) {
+172	        *physical = addr;
+173	        *prot = PAGE_READ | PAGE_WRITE | PAGE_EXEC;
+174	        return TRANSLATE_SUCCESS;
+175	    }
+176	
+177	    *prot = 0;
+178	
+179	    target_ulong base;
+180	    int levels, ptidxbits, ptesize, vm, sum;
+Breakpoint 1 at 0x56b90ce41740: file /opt/riscv/qemu-4.1.1/target/riscv/cpu_helper.c, line 158.
+
+===== [终端2 / host gdb] 命中 get_physical_address =====
+addr=0xffffffffc02000d6  satp=0x0 (MODE=0)  access_type=0
+#0  get_physical_address (env=0x56b9146319d0, physical=physical@entry=0x7ffc2b5ea4f0, prot=prot@entry=0x7ffc2b5ea4ec, addr=addr@entry=18446744072637907158, access_type=access_type@entry=0, mmu_idx=3) at /opt/riscv/qemu-4.1.1/target/riscv/cpu_helper.c:158
+#1  0x000056b90ce41e0c in riscv_cpu_get_phys_page_debug (cs=<optimized out>, addr=18446744072637907158) at /opt/riscv/qemu-4.1.1/target/riscv/cpu_helper.c:389
+#2  0x000056b90cd59094 in cpu_get_phys_page_attrs_debug (cpu=0x56b914628fc0, addr=18446744072637907158, attrs=0x7ffc2b5ea514) at /opt/riscv/qemu-4.1.1/include/qom/cpu.h:607
+#3  breakpoint_invalidate (cpu=cpu@entry=0x56b914628fc0, pc=18446744072637907158) at /opt/riscv/qemu-4.1.1/exec.c:1054
+#4  0x000056b90cd59409 in cpu_breakpoint_insert (cpu=cpu@entry=0x56b914628fc0, pc=pc@entry=18446744072637907158, flags=flags@entry=16, breakpoint=breakpoint@entry=0x0) at /opt/riscv/qemu-4.1.1/exec.c:1196
+#5  0x000056b90cda9d47 in gdb_breakpoint_insert (type=<optimized out>, addr=18446744072637907158, len=<optimized out>) at /opt/riscv/qemu-4.1.1/gdbstub.c:993
+[Switching to Thread 0x7ab715fff6c0 (LWP 8259)]
+
+===== [终端2 / host gdb] 命中 get_physical_address =====
+addr=0xffffffffc02000d6  satp=0x8000000000080205 (MODE=8)  access_type=2
+#0  get_physical_address (env=env@entry=0x56b9146319d0, physical=physical@entry=0x7ab715ffe300, prot=prot@entry=0x7ab715ffe2fc, addr=addr@entry=18446744072637907158, access_type=access_type@entry=2, mmu_idx=mmu_idx@entry=1) at /opt/riscv/qemu-4.1.1/target/riscv/cpu_helper.c:158
+#1  0x000056b90ce41fdb in riscv_cpu_tlb_fill (cs=0x56b914628fc0, address=18446744072637907158, size=0, access_type=MMU_INST_FETCH, mmu_idx=1, probe=false, retaddr=0) at /opt/riscv/qemu-4.1.1/target/riscv/cpu_helper.c:451
+#2  0x000056b90cdc2944 in tlb_fill (cpu=cpu@entry=0x56b914628fc0, addr=addr@entry=18446744072637907158, size=size@entry=0, access_type=access_type@entry=MMU_INST_FETCH, mmu_idx=mmu_idx@entry=1, retaddr=retaddr@entry=0) at /opt/riscv/qemu-4.1.1/accel/tcg/cputlb.c:878
+#3  0x000056b90cdc5e41 in get_page_addr_code (env=0x56b9146319d0, addr=addr@entry=18446744072637907158) at /opt/riscv/qemu-4.1.1/include/exec/cpu-all.h:404
+#4  0x000056b90cddfe26 in tb_htable_lookup (cpu=cpu@entry=0x56b914628fc0, pc=pc@entry=18446744072637907158, cs_base=cs_base@entry=0, flags=flags@entry=24577, cf_mask=4278714368) at /opt/riscv/qemu-4.1.1/accel/tcg/cpu-exec.c:339
+#5  0x000056b90cddb098 in tb_lookup__cpu_state (cpu=<optimized out>, pc=<synthetic pointer>, cs_base=<synthetic pointer>, flags=<synthetic pointer>, cf_mask=<optimized out>) at /opt/riscv/qemu-4.1.1/include/exec/tb-lookup.h:43
+[Switching to Thread 0x7ab718c57b00 (LWP 8256)]
+
+===== [终端2 / host gdb] 命中 get_physical_address =====
+addr=0xffffffffc02000d6  satp=0x8000000000080205 (MODE=8)  access_type=0
+#0  get_physical_address (env=0x56b9146319d0, physical=physical@entry=0x7ffc2b5ea510, prot=prot@entry=0x7ffc2b5ea50c, addr=addr@entry=18446744072637907158, access_type=access_type@entry=0, mmu_idx=1) at /opt/riscv/qemu-4.1.1/target/riscv/cpu_helper.c:158
+#1  0x000056b90ce41e0c in riscv_cpu_get_phys_page_debug (cs=<optimized out>, addr=18446744072637907158) at /opt/riscv/qemu-4.1.1/target/riscv/cpu_helper.c:389
+#2  0x000056b90cd59094 in cpu_get_phys_page_attrs_debug (cpu=0x56b914628fc0, addr=18446744072637907158, attrs=0x7ffc2b5ea534) at /opt/riscv/qemu-4.1.1/include/qom/cpu.h:607
+#3  breakpoint_invalidate (cpu=0x56b914628fc0, pc=18446744072637907158) at /opt/riscv/qemu-4.1.1/exec.c:1054
+#4  0x000056b90cd59498 in cpu_breakpoint_remove_by_ref (cpu=0x56b914628fc0, breakpoint=0x56b9148d3280) at /opt/riscv/qemu-4.1.1/exec.c:1223
+#5  cpu_breakpoint_remove (cpu=cpu@entry=0x56b914628fc0, pc=pc@entry=18446744072637907158, flags=flags@entry=16) at /opt/riscv/qemu-4.1.1/exec.c:1211
+[Thread 0x7ab715fff6c0 (LWP 8259) exited]
+[Thread 0x7ab7189536c0 (LWP 8258) exited]
+
+Program terminated with signal SIGKILL, Killed.
+The program no longer exists.
