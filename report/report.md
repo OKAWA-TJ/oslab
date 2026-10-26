@@ -472,164 +472,843 @@ void slub_free(void *ptr) {
 
 ---
 
-## 五、gdb 调试页表查询过程（双重 GDB 观察地址翻译）
+## 五、GDB 调试 QEMU 的页表查询过程（双重 GDB 观察地址翻译）
 
-本节完成 lab 指导书中的「gdb 调试页表查询过程」练习。核心玩法是「俄罗斯套娃」式的**双重 GDB**：不再只单步调试 ucore 内核，而是同时观察「被模拟系统 ucore」与「模拟器 QEMU」两个层面——先在 ucore 里停下来看到要执行的 RISC-V 指令，再钻进 QEMU 的 C 源码，看它如何完成对这条指令的地址翻译。下面按指导书的 6 条「调试要求」逐一回答。
+本节完成 lab 指导书中的「gdb 调试页表查询过程」分支任务：用两个 GDB 同时观察「被模拟系统 ucore」与「模拟器 QEMU」两个层面，跟踪一条存储指令 `sd ra,8(sp)` 从软件 TLB 查询、Sv39 页表遍历、TLB 回填到宿主内存写入的完整过程。
 
-### 5.1 调试目标与「双重 GDB」架构
+### 一、实验目的与观察对象
 
-三个终端（窗口）的分工与执行次序：
+本实验采用三个终端、两个 GDB，跟踪 ucore 的一条存储指令在 QEMU 中的执行过程：从软件 TLB 查询开始，经过页表遍历、权限检查、TLB 回填，最终完成宿主内存写入；随后重复执行同一条指令，观察 TLB 命中的快速路径，并与关闭分页时的 Bare 访存进行比较。
 
-| 终端 | 命令 | 作用 |
-| --- | --- | --- |
-| 终端 1 | `make debug`（=`qemu-system-riscv64 … -s -S`） | 启动调试版 QEMU，`-S` 暂停在复位初始状态 |
-| 终端 2 | `sudo gdb` + `attach <QEMU PID>` | 用 **x86 host gdb** 附加到 QEMU 进程本身，调试 QEMU 的 C 源码 |
-| 终端 3 | `make gdb`（`riscv64-unknown-elf-gdb` 连 `:1234`） | 用 **riscv gdb** 连 QEMU 的 gdb stub，调试模拟器里的 ucore |
+主实验选取 `kern_init` 中的 `sd ra,8(sp)`。本次得到的三层地址为：
 
-**关键点**：两个 gdb 的目标完全不同——终端 2 的 host gdb 是 x86 的，调试对象是 QEMU 进程（宿主机上的 x86 程序）；终端 3 的 riscv gdb 是 riscv64 专用交叉 gdb，通过 QEMU 的 `:1234` gdb stub 调试运行在模拟器内的 RISC-V 内核。前者看「软件如何模拟硬件」，后者看「被模拟的内核如何执行」。
+| 地址层次 | 实测值 | 含义 |
+|---|---|---|
+| 来宾虚拟地址 GVA | `0xffffffffc0203ff8` | ucore 指令计算出的 `sp + 8` |
+| 来宾物理地址 GPA | `0x80203ff8` | Sv39 页表翻译得到的访存地址 |
+| 宿主虚拟地址 HVA | `0x7464c8003ff8` | QEMU 进程实际写入的 RAM 地址 |
 
-> 指导书特别提醒：终端 2 需要先执行 `handle SIGPIPE nostop noprint`。若不执行，gdb 在收到 `SIGPIPE` 信号时会中断 `continue`，导致整个调试流程卡死（详见 5.7 的问题记录）。
+首次访问时，主 TLB 和 victim TLB 均未命中；根页表第 511 项提供了一个 1 GiB 大页映射。完成回填后，再次执行该指令，生成的 x86 代码直接通过 TLB 标签比较并完成写入。
 
-### 5.2 关键调用路径与关键分支语句（调试要求 1）
+### 二、实验环境与三个终端的建立
 
-**调用路径（call path）**：一次「取指」从 RISC-V 指令执行到 QEMU 完成地址翻译的完整链路，用 host gdb 在 `get_physical_address` 入口处的 `bt` 命令现场抓到（截图见 5.3）：
+#### 2.1 调试环境
 
+| 项目 | 配置 |
+|---|---|
+| 宿主平台 | x86_64 Linux |
+| 模拟器 | QEMU 4.1.1，`riscv64-softmmu`，带调试信息 |
+| 来宾平台 | RISC-V 64 位，`virt` 开发板，OpenSBI v0.4 |
+| 宿主调试器 | `/usr/bin/gdb`，调试 QEMU 的 C 源码和 x86 指令 |
+| 来宾调试器 | `riscv64-unknown-elf-gdb`，调试 ucore 的 RISC-V 指令 |
+| 内核目录 | `/home/hzr/OS/oslab/code` |
+| QEMU 可执行文件 | `/home/hzr/OS/qemu-4.1.1/riscv64-softmmu/qemu-system-riscv64` |
+| 内核符号文件 | `/home/hzr/OS/oslab/code/bin/kernel` |
+| GDB stub | `127.0.0.1:1234` |
+
+使用已有的 QEMU 调试构建，其配置包含：
+
+```bash
+./configure --target-list=riscv32-softmmu,riscv64-softmmu --enable-debug --disable-werror
 ```
-#0  get_physical_address      target/riscv/cpu_helper.c:158   ← 页表走查核心
-#1  riscv_cpu_tlb_fill        target/riscv/cpu_helper.c:451   ← 软 TLB 未命中，发起翻译
-#2  tlb_fill                  accel/tcg/cputlb.c:878          ← 通用 TLB 未命中处理
-#3  get_page_addr_code        include/exec/cpu-all.h:404      ← 取指前查 TLB / 触发翻译
-#4  tb_htable_lookup          accel/tcg/cpu-exec.c:339        ← 查找翻译块(TB)哈希表
-#5  tb_lookup__cpu_state      include/exec/tb-lookup.h:43
-#6  helper_lookup_tb_ptr      accel/tcg/tcg-runtime.c:154     ← TCG 运行时 helper
-#7  code_gen_buffer           (TCG 动态生成的 host 代码)
-#8  cpu_tb_exec               accel/tcg/cpu-exec.c:173        ← 执行翻译块
-#9  cpu_loop_exec_tb          accel/tcg/cpu-exec.c:621        ← 主执行循环
+
+通过 Makefile 命令行参数指定这个可执行文件，三个终端的分工如下。
+
+| 终端 | 运行内容 | 负责的操作 |
+|---|---|---|
+| 终端 1 | QEMU | 启动模拟器、显示 OpenSBI 和内核输出 |
+| 终端 2 | 宿主 GDB | 附加 QEMU 进程，观察软件 TLB、页表查询与宿主写入 |
+| 终端 3 | 来宾 GDB | 控制 ucore 停在目标指令，检查 `pc`、`sp`、`satp` 等寄存器 |
+
+#### 2.2 按顺序启动
+
+**第一步，在终端 1 启动 QEMU：**
+
+```bash
+cd /home/hzr/OS/oslab/code
+make debug QEMU=/home/hzr/OS/qemu-4.1.1/riscv64-softmmu/qemu-system-riscv64
 ```
 
-（完整原始调用栈含各帧寄存器参数，见 [walk_hostgdb.txt](./images/gdb/walk_hostgdb.txt)，此处省略参数以节省篇幅。）
+Makefile 使用 `-s -S`：`-s` 在 1234 端口提供 GDB stub，`-S` 让来宾 CPU 在启动时暂停，等待调试器控制。
 
-这条链路说明 QEMU 的执行模型：**每次 CPU 要执行一段新代码时，先到「翻译块（TB）缓存」里找有没有已翻译好的 host 代码（`tb_htable_lookup`）；找到后要取指，就得先算出这条指令所在页的物理地址（`get_page_addr_code`），而这一步会先查软 TLB，未命中才 `tlb_fill` → 页表走查。**
+**第二步，在终端 2 找到并附加 QEMU：**
 
-**关键分支语句**（`get_physical_address` 内，`target/riscv/cpu_helper.c`）：
+```bash
+pgrep -af qemu-system-riscv64
+sudo gdb -q -p 11306
+```
 
-| 行 | 分支语句 | 含义 |
-| --- | --- | --- |
-| 165 | `if (mode == PRV_M && access_type != MMU_INST_FETCH)` | M 模式 + `mstatus.MPRV` 时改用 `MPP` 当作特权级做翻译 |
-| 171 | `if (mode == PRV_M || !riscv_feature(env, RISCV_FEATURE_MMU))` | **M 模式 / 无 MMU：`*physical = addr` 恒等映射，直接返回**（即 MMU 使能前的路径） |
-| 188 | `switch (vm) { case VM_1_10_SV39: levels=3; ptidxbits=9; ptesize=8; }` | 按 `satp.MODE` 选页表格式：Sv39 = 三级、每级 9 位索引、每 PTE 8 字节 |
-| 222 | `if (masked_msbs != 0 && masked_msbs != mask)` | 规范地址检查：39 位有效地址之外的高位必须全 0 或全 1（符号扩展） |
-| 237 | `for (i=0; i<levels; i++, ptshift-=ptidxbits)` | **三级走查循环**（见 5.3） |
-| 256 | `if (!(pte & PTE_V))` | 无效 PTE → `TRANSLATE_FAIL` |
-| 258 | `else if (!(pte & (PTE_R|PTE_W|PTE_X)))` | 内部（非叶）PTE → `base = ppn << 12` 进入下一级继续走 |
-| 334 | `*physical = (ppn | (vpn & ((1L<<ptshift)-1))) << 12` | 叶 PTE → 拼出最终物理地址，返回 `TRANSLATE_SUCCESS` |
+本次输出中，`11302` 是 `make debug`，`11306` 才是执行 QEMU 的进程。附加后设置：
 
-### 5.3 Sv39 页表走查的单步分析（调试要求 2）
+```gdb
+set pagination off
+handle SIGPIPE nostop noprint pass
+continue
+```
 
-**调试演示**：在终端 2 打条件断点 `break get_physical_address if addr == 0xffffffffc02000d6`（`kern_init` 的地址，内核必然取指访问它），一次抓全「谁在翻译、翻成什么」：
+`continue` 恢复 QEMU 进程运行，使它能够处理来宾 GDB 的连接请求；来宾 CPU 此时仍由 `-S` 保持暂停。
 
-![gdb 调试 QEMU 源码：页表走查](./images/gdb/gdb_walk.png)
+**第三步，在终端 3 连接来宾：**
 
-逐项解释截图里的关键输出：
+```bash
+cd /home/hzr/OS/oslab/code
+make gdb
+```
 
-- **`addr = 0xffffffffc02000d6`**：被翻译的虚拟地址 = `kern_init` 的链接地址。
-- **`satp = 0x8000000000080205`**：高 4 位 `MODE = 8`（Sv39），低 44 位根页表 `PPN = 0x80205`，故根页表物理基址 = `0x80205 << 12 = 0x80205000`。
-- **`access_type = 2`（`MMU_INST_FETCH`）、`mmu_idx = 1`（S 模式）**：这是一次 S 模式取指触发的翻译。
-- **第一级索引**：`VPN[2] = (addr>>30) & 0x1ff = 0x1ff`（511），对应 PTE 物理地址 = `0x80205000 + 511×8 = 0x80205ff8`。
+`make gdb` 加载 `bin/kernel`，选择 `riscv:rv64` 架构并连接端口 1234。在来宾 GDB 中设置：
 
-**「三个循环 / 取出页表项」在做什么**（对应指导书中的疑问）：
+```gdb
+set pagination off
+set remotetimeout 600
+```
 
-走查循环的**每次迭代只做两件事——「取索引」和「取页表项」**：
+本次最初连接时，终端 2 尚停在宿主 GDB 提示符，终端 3 因此报告 `timeout`。在终端 2 执行 `continue` 后，终端 3 重新连接成功：
+
+```gdb
+target remote 127.0.0.1:1234
+info registers pc
+```
+
+返回 `pc=0x1000`，说明已经连接到处于复位入口的来宾 CPU。
+
+![图 1：三个终端分别运行 QEMU、宿主 GDB 和来宾 GDB](./images/gdb/00.png)
+
+图 1 展示了三个终端的布局及最初连接时的输出。实际调试中，两个暂停层次的关系贯穿整个过程：终端 2 停住 QEMU 时，终端 3 的远程请求也会等待；终端 2 恢复运行后，终端 3 才能继续收到应答。
+
+### 三、确定目标访存指令
+
+在终端 3 设置指令断点，连续运行到 `kern_init` 的栈写入位置：
+
+```gdb
+hbreak *0xffffffffc02000ee
+continue
+x/i $pc
+info registers pc sp ra satp
+```
+
+观察到：
+
+```text
+pc   = 0xffffffffc02000ee
+指令 = sd ra,8(sp)
+sp   = 0xffffffffc0203ff0
+ra   = 0x80000a02
+satp = 0x8000000000080204
+```
+
+该指令将 `ra` 的 8 字节值保存到栈上，其有效地址为：
+
+```text
+VA = sp + 8
+   = 0xffffffffc0203ff0 + 8
+   = 0xffffffffc0203ff8
+```
+
+`pc` 指向指令本身，`sp+8` 才是这次数据存储访问的地址。`satp` 的 MODE 为 8，表明此时已启用 Sv39。
+
+![图 2：来宾停在目标存储指令，显示 sp 和 satp](./images/gdb/01.png)
+
+接着切换到终端 2，按 **Ctrl-C** 暂停 QEMU，设置存储辅助函数的临时断点，再恢复 QEMU：
+
+```gdb
+tbreak helper_le_stq_mmu
+continue
+```
+
+回到终端 3 执行：
+
+```gdb
+si
+```
+
+终端 2 随即停在该辅助函数中。终端 3 等待这一条来宾指令执行完成，接下来的页表和 TLB 单步操作均在终端 2 进行。
+
+### 四、观察软件 TLB 未命中及调用路径
+
+#### 4.1 主 TLB 查询
+
+在终端 2 进入 `store_helper`，执行到 TLB 项已取出的地方：
+
+```gdb
+step
+until 1508
+p mmu_idx
+p index
+p/x tlb_addr
+p/x *entry
+until 1519
+step
+finish
+```
+
+相关代码位于 `accel/tcg/cputlb.c`：
 
 ```c
-target_ulong idx = (addr >> (PGSHIFT + ptshift)) & ((1 << ptidxbits) - 1); // ① 取 VPN[i]（9 位）
-target_ulong pte_addr = base + idx * ptesize;                              // ② 算出 PTE 物理地址
-target_ulong pte = ldq_phys(cs->as, pte_addr);                             // ③ 从物理内存读出 8 字节 PTE
-target_ulong ppn = pte >> PTE_PPN_SHIFT;                                   // ④ 取 PTE 的 PPN 字段
+uintptr_t mmu_idx = get_mmuidx(oi);
+uintptr_t index = tlb_index(env, mmu_idx, addr);
+CPUTLBEntry *entry = tlb_entry(env, mmu_idx, addr);
+target_ulong tlb_addr = tlb_addr_write(entry);
 ```
 
-- 若 PTE 是**内部节点**（`V=1` 但 `R/W/X` 全 0）：`base = ppn << 12`，下一轮向下一级走。
-- 若 PTE 是**叶节点**（`R/W/X` 至少一个为 1）：用 `ppn` 拼出物理地址，走查结束。
+`mmu_idx` 选择对应访问上下文的软件 TLB，本次值为 1，对应 S 模式。`tlb_index` 根据虚拟页号与表掩码定位槽位，本次 `index=3`；随后读取该槽位的写访问标签 `addr_write`。
 
-**为什么本次只走了一级**：lab2 的启动页表 `boot_page_table_sv39` 在 `kern/init/entry.S` 里只填了一个 1GiB 大页（`.quad (0x80000 << 10) | 0xcf`，即 PPN=`0x80000`、标志 `V|R|W|X|A|D`=`0xcf`）。它在第一级（`VPN[2]=511`）就已经是叶节点，所以 `levels=3` 的循环**只执行一次就命中大页返回**，而不是像通用多级页表那样走满三级。
+实测结果为：
 
-**最终翻译结果**：`pa = 0x80200000`（页对齐基址）、`prot = 0x7`（`PAGE_READ|PAGE_WRITE|PAGE_EXEC`）。加上页内偏移 `0xd6`，最终物理地址 = `0x802000d6`，恰好等于 `PADDR(kern_init)` = `0x80200000 + 0xd6`，验证了「虚拟地址 `0xffffffffc02000d6` 经 Sv39 页表翻译成物理地址 `0x802000d6`」。
+```text
+mmu_idx   = 1
+index     = 3
+tlb_addr  = 0xffffffffffffffff
+addr_read = 0xffffffffffffffff
+addr_write= 0xffffffffffffffff
+addr_code = 0xffffffffffffffff
+addend    = 0xffffffffffffffff
+tlb_hit(...) 返回 false
+```
 
-### 5.4 QEMU 中模拟 TLB 查找的 C 代码（调试要求 3）
-
-指导书问：「按照 RISC-V 的流程，是不是应该**先查 TLB，TLB miss 之后才从页表中查找**？」——**是的**。QEMU 模拟了同样的两段式流程，代码就在 `accel/tcg/cputlb.c`。
-
-**取指路径的 TLB 查找**（`get_page_addr_code`，`accel/tcg/cputlb.c:1023`）：
+`include/exec/cpu-all.h` 中的 C 查询代码为：
 
 ```c
-tb_page_addr_t get_page_addr_code(CPUArchState *env, target_ulong addr)
+static inline bool tlb_hit_page(target_ulong tlb_addr, target_ulong addr)
 {
-    uintptr_t mmu_idx = cpu_mmu_index(env, true);
-    uintptr_t index = tlb_index(env, mmu_idx, addr);       // 由 VA 算出 TLB 组索引
-    CPUTLBEntry *entry = tlb_entry(env, mmu_idx, addr);    // 取对应 TLB 表项
-    void *p;
+    return addr == (tlb_addr & (TARGET_PAGE_MASK | TLB_INVALID_MASK));
+}
 
-    if (unlikely(!tlb_hit(entry->addr_code, addr))) {       // ① 先查 TLB（快路径）
-        if (!VICTIM_TLB_HIT(addr_code, addr)) {             // ② 再看小容量 victim TLB
-            tlb_fill(env_cpu(env), addr, 0, MMU_INST_FETCH, mmu_idx, 0); // ③ 未命中 → 填 TLB
-        }
-    }
-    ...
-    p = (void *)((uintptr_t)addr + entry->addend);          // 命中：VA + addend 直接得 host 指针
-    return qemu_ram_addr_from_host_nofail(p);
+static inline bool tlb_hit(target_ulong tlb_addr, target_ulong addr)
+{
+    return tlb_hit_page(tlb_addr, addr & TARGET_PAGE_MASK);
 }
 ```
 
-`tlb_fill`（`cputlb.c:868`）就是「TLB miss 处理函数」：它调用 `cc->tlb_fill`，对 RISC-V 而言即 `riscv_cpu_tlb_fill`（`cpu_helper.c:435`），后者执行 `get_physical_address` **做真正的页表走查**，成功后再 `tlb_set_page` 把结果写回软 TLB。
+它先取出目标页地址 `0xffffffffc0203000`，再与保留无效标志的 TLB 标签比较。当前槽位处于无效状态，因此返回 `false`。
 
-**数据访存路径**同样遵循「先查后填」：TCG 生成的访存 helper（`io_readx`/`io_writex` 及 `tlb_addr_read`/`tlb_addr_write` 的判定，见 `cputlb.c:1067/1161/1271`）先 `tlb_hit(entry->addr_read/write, addr)`，未命中才 `tlb_fill`。
+![图 3：主 TLB 槽位无效，tlb_hit 返回 false](./images/gdb/02.png)
 
-**判断「命中」的依据**是 `tlb_hit` 宏：`(entry->addr_xx & ~TLB_INVALID_MASK) == (addr & TARGET_PAGE_MASK)`——即软 TLB 表项里缓存的**页对齐 guest VA** 是否等于本次访问的页。命中后无需再翻译，直接用 `addr + addend` 得到宿主机内存指针，这就是 QEMU 快得起来的原因。
+#### 4.2 victim TLB 查询
 
-### 5.5 QEMU 软件 TLB 与真实硬件 TLB 的区别（调试要求 4）
+主表未命中后，继续观察 victim TLB：
 
-指导书提示「找一条**未开启虚拟地址空间**的访存语句与**开启之后**的对比」。双重 GDB 的 attach 日志恰好同时抓到了这两种情形（同一地址 `0xffffffffc02000d6` 被翻译三次）：
+```gdb
+tbreak victim_tlb_hit
+continue
+p mmu_idx
+p index
+p/x page
+finish
+```
 
-![双重 GDB：host gdb attach 三连击](./images/gdb/gdb_dual_attach.png)
+结果为：
 
-| 命中 | 触发来源 | `satp`（MODE） | `mmu_idx` | 走查结果 |
-| --- | --- | --- | --- | --- |
-| 1 | riscv gdb **插入断点**时翻译断点地址 | `0x0`（MODE=0，Bare） | 3（M 态） | `*physical = addr` **恒等映射**，直接返回（第 171 行分支） |
-| 2 | 内核真正**取指** `kern_init` | `0x8000000000080205`（MODE=8，Sv39） | 1（S 态） | 完整 **Sv39 页表走查**（5.3 节） |
-| 3 | riscv gdb **删除断点**时再次翻译 | `0x8000000000080205`（MODE=8） | 1（S 态） | 完整 Sv39 走查 |
+```text
+mmu_idx = 1
+index   = 3
+page    = 0xffffffffc0203000
+返回值  = false
+```
 
-命中 1 对应「未开启虚拟地址空间」：`satp.MODE=0`，`get_physical_address` 在 **171 行**提前 `return`，物理地址等于虚拟地址（`0xffffffffc02000d6` 被当作物理地址处理）。命中 2/3 对应「开启之后」：`satp.MODE=8`，走完整页表。
+QEMU 4.1.1 还维护了一个 8 项的 victim TLB，用来保存从主表替换出去的表项。`victim_tlb_hit` 逐项比较访问标签，命中时将找到的项与主表槽位交换。本次查询仍返回 `false`，因此需要重新进行地址翻译。
 
-**QEMU 软件 TLB 与真实 CPU TLB 的逻辑区别**：
+![图 4：victim TLB 同样未命中](./images/gdb/03_1.png)
 
-| 维度 | 真实 RISC-V TLB | QEMU 软件 TLB |
-| --- | --- | --- |
-| 本质 | 硬件快表（CAM），几十个条目 | 软件数组 `CPUTLBEntry[]`（每个 `mmu_idx` 一张），条目更多，另有小容量 victim TLB |
-| 缓存的内容 | guest VA → guest **物理地址（PPN）** + 权限位 | guest VA → **宿主虚拟地址**（`addend = host_va − guest_va`） |
-| miss 后 | 硬件页表走查器（Sv39 三级）自动填表，或陷入内核由软件填 | 调用 C 函数 `tlb_fill` → `riscv_cpu_tlb_fill` → `get_physical_address` **软件走查**后 `tlb_set_page` 填表 |
-| 命中后 | 直接得到物理地址，送总线访存 | 直接 `addr + addend` 解引用宿主内存指针，完成 guest 内存读写 |
-| 附加信息 | 通常含 ASID、全局位等 | 在地址字段低位编码 `TLB_MMIO`（MMIO 区）、`TLB_NOTDIRTY`、`TLB_RECHECK`、`TLB_INVALID_MASK` 等标志 |
+#### 4.3 进入 RISC-V 地址翻译
 
-**最根本的区别**：真实 TLB 翻译出的产物是**物理地址**；而 QEMU 自己就运行在真实的宿主 CPU 上，它最终要的是**宿主机上能直接读写的内存指针**，所以软 TLB 缓存的是 `addend`（宿主虚拟地址 − guest 虚拟地址），命中后一步解引用，绕过「guest VA → guest PA → host VA」的两次换算。
+继续设置临时断点并打印调用栈：
 
-### 5.6 调试过程中的「抓马」细节与收获（调试要求 5）
+```gdb
+tbreak riscv_cpu_tlb_fill
+continue
+p/x address
+p access_type
+p mmu_idx
+bt 8
+```
 
-1. **断点本身也会触发翻译**：命中 1 和命中 3 都不是内核执行触发的，而是 gdb **插入/删除断点**时，QEMU 需要把断点地址翻译成物理地址去改写内存中的指令字节（`breakpoint_invalidate` → `cpu_breakpoint_insert/remove` → `riscv_cpu_get_phys_page_debug` → `get_physical_address`）。这直观地说明了「访存的不只是程序，调试器、异常处理等一切读内存的路径都要先翻译」。
-2. **`-O2 -g` 导致局部变量 `<optimized out>`**：调试版 QEMU 带 `-O2` 优化，`get_physical_address` 里的 `levels`/`idx`/`pte`/`ppn` 等局部变量全部被优化掉，`print` 会报 `<optimized out>`。绕过办法是**不打印局部变量，改用函数参数 `addr`、`env->satp` 现场按公式重算**（`VPN[2] = (addr>>30)&0x1ff` 等），反而把走查过程「手算」了一遍，理解更深。
-3. **QEMU 的 TLB 是「翻译结果缓存」而非「翻译器」**：看到 `entry->addend` 的那一瞬间才真正明白——QEMU 为了快，把「guest 页 → 宿主内存页」的偏移缓存起来，命中后连物理地址都不再算，直接指针运算。这正是「软件模拟硬件」的精髓：模拟的是**语义**，实现可以完全不同。
-4. **三个终端的时间耦合很微妙**：终端 2 的 host gdb 必须先 `continue` 起来，终端 3 的 riscv gdb 才能 `target remote` 连上并继续执行，否则 QEMU 停在复位态、谁都不会动。指导书自己也承认「用文字解释三个终端的次序很麻烦」。
+输出显示 `address=0xffffffffc0203ff8`、`access_type=MMU_DATA_STORE`、`mmu_idx=1`，与来宾指令的访问地址和类型一致。
 
-### 5.7 通过大模型解决的问题记录（调试要求 6）
+![图 5：进入 riscv_cpu_tlb_fill，调用栈连接来宾存储与页表翻译](./images/gdb/03_2.png)
 
-| 情景 | 思路 | 与大模型的交互过程 |
-| --- | --- | --- |
-| 终端 2 执行 `continue` 后被 `SIGPIPE` 打断 | gdb 收到管道信号会中断继续执行 | 把命令行报错原文发给大模型，它给出 `handle SIGPIPE nostop noprint`，让 gdb 忽略该信号不再停下 |
-| 不知该在 QEMU 哪里打断点 | 「既然访存，地址比指令重要」 | 大模型建议：找「一定被访问的地址」（如 `kern_init`），在翻译函数入口打**条件断点** `if addr == 0xffffffffc02000d6`，从而无需单步 ucore，一次定位 |
-| 想打印走查中的局部变量却全 `<optimized out>` | `-O2 -g` 把局部变量优化掉了 | 大模型建议改用参数与 `env->satp` 现场重算，并在函数入口（而非走查循环内）取参 |
-| 双重 GDB 一直卡住不动 | riscv gdb 没加载符号，断点变 pending | 大模型指出 gdb 脚本缺 `file bin/kernel`，补上后 `break kern_init` 才解析到 `0xffffffffc02000d6` |
-| 不熟悉 QEMU 源码、找不到地址翻译代码 | 大模型帮忙定位关键位置 | 大模型给出 `grep` 定位 `riscv_cpu_tlb_fill`/`get_physical_address`/`tlb_fill`/`tlb_set_page` 等符号与 `cpu_helper.c`/`cputlb.c` 的行号，再逐段读源码理解 |
+根据调用栈和单步结果，本次执行过程为：
 
-> 完整的原始调试记录见 [walk_hostgdb.txt](./images/gdb/walk_hostgdb.txt)（单 gdb 页表走查）、[dualgdb_attach.txt](./images/gdb/dualgdb_attach.txt)（host gdb attach 三连击）、[dualgdb_riscv.txt](./images/gdb/dualgdb_riscv.txt)（riscv gdb 侧），以及三张截图 [gdb_walk.png](./images/gdb/gdb_walk.png)、[gdb_dual_attach.png](./images/gdb/gdb_dual_attach.png)、[gdb_riscv.png](./images/gdb/gdb_riscv.png)。
+```text
+cpu_exec → cpu_loop_exec_tb → cpu_tb_exec
+  → 执行 code_gen_buffer 中的宿主代码
+    → helper_le_stq_mmu
+      → store_helper
+        → tlb_hit：false
+        → victim_tlb_hit：false
+        → tlb_fill
+          → riscv_cpu_tlb_fill
+            → get_physical_address
+            → PMP 权限检查
+            → tlb_set_page
+        → stq_le_p：完成宿主内存写入
+```
+
+决定是否进入翻译函数的关键分支位于 `store_helper`：
+
+```c
+if (!tlb_hit(tlb_addr, addr)) {
+    if (!victim_tlb_hit(env, mmu_idx, index, tlb_off,
+                        addr & TARGET_PAGE_MASK)) {
+        tlb_fill(env_cpu(env), addr, size, MMU_DATA_STORE,
+                 mmu_idx, retaddr);
+    }
+    /* 重新取得回填后的表项 */
+}
+```
+
+这里两次判断的结果均为未命中，执行因而进入 `tlb_fill`，再通过 CPU 的架构相关回调进入 `riscv_cpu_tlb_fill`。
+
+### 五、单步分析 Sv39 页表查询
+
+#### 5.1 从 satp 取得根页表
+
+在终端 2 继续：
+
+```gdb
+tbreak get_physical_address
+continue
+p/x addr
+p/x env->satp
+until 237
+p levels
+p ptidxbits
+p ptesize
+p/x base
+p ptshift
+```
+
+得到：
+
+```text
+addr      = 0xffffffffc0203ff8
+satp      = 0x8000000000080204
+levels    = 3
+ptidxbits = 9
+ptesize   = 8
+base      = 0x80204000
+ptshift   = 18
+```
+
+将 `satp` 分解为 MODE、ASID 和根页表物理页号：
+
+```text
+MODE = 8                 → Sv39
+ASID = 0
+PPN  = 0x80204
+根页表物理地址 = PPN << 12 = 0x80204000
+```
+
+Sv39 的页内偏移占 12 位，每一级索引占 9 位。目标地址分解为：
+
+| 字段 | 计算 | 结果 |
+|---|---|---|
+| VPN[2] | `(addr >> 30) & 0x1ff` | `511` |
+| VPN[1] | `(addr >> 21) & 0x1ff` | `1` |
+| VPN[0] | `(addr >> 12) & 0x1ff` | `3` |
+| 页内偏移 | `addr & 0xfff` | `0xff8` |
+
+#### 5.2 读取根页表第 511 项
+
+页表遍历由一个最多执行三次的循环实现：
+
+```c
+for (i = 0; i < levels; i++, ptshift -= ptidxbits) {
+    target_ulong idx = (addr >> (PGSHIFT + ptshift)) &
+                      ((1 << ptidxbits) - 1);
+    target_ulong pte_addr = base + idx * ptesize;
+    /* 检查读取 PTE 的物理访问权限 */
+    target_ulong pte = ldq_phys(cs->as, pte_addr);
+    target_ulong ppn = pte >> PTE_PPN_SHIFT;
+    /* 检查当前 PTE，决定继续遍历还是使用叶子映射 */
+}
+```
+
+`ptshift` 从 18 开始，每轮减 9，依次选择 VPN[2]、VPN[1]、VPN[0]。`base` 保存当前页表的物理基址，`idx` 选择其中的一个 8 字节表项。`ldq_phys` 从来宾物理内存读取 PTE。
+
+执行到第 254 行时检查：
+
+```gdb
+until 254
+p i
+p idx
+p/x base
+p/x pte_addr
+p/x pte
+next
+p/x ppn
+```
+
+实测：
+
+```text
+i        = 0
+idx      = 511
+base     = 0x80204000
+pte_addr = 0x80204ff8
+pte      = 0x200000cf
+ppn      = 0x80000
+```
+
+地址计算与输出一致：
+
+```text
+pte_addr = 0x80204000 + 511 × 8 = 0x80204ff8
+ppn      = 0x200000cf >> 10     = 0x80000
+```
+
+![图 6：根页表第 511 项的地址与内容](./images/gdb/04.png)
+
+#### 5.3 判断叶子项、权限和 A/D 位
+
+`pte=0x200000cf` 的低 8 位为 `11001111`，各标志位含义如下。
+
+| 标志位 | 值 | 本次访问中的含义 |
+|---|---:|---|
+| V | 1 | 页表项有效 |
+| R | 1 | 允许读取 |
+| W | 1 | 允许写入 |
+| X | 1 | 允许执行 |
+| U | 0 | supervisor 页 |
+| G | 0 | 未设置全局标志 |
+| A | 1 | 已访问 |
+| D | 1 | 已写入 |
+
+遍历函数在读出 PTE 后依次处理以下分支：
+
+| 检查 | 作用 | 本次结果 |
+|---|---|---|
+| `!(pte & PTE_V)` | 拒绝无效项 | V=1，通过 |
+| `!(pte & (PTE_R \| PTE_W \| PTE_X))` | 识别下一级页表，执行 `base=ppn<<12` | RWX 均为 1，当前项是叶子 |
+| W=1 且 R=0 的保留组合 | 拒绝非法权限编码 | R=1，通过 |
+| U/S 与 SUM 检查 | 判断当前模式能否访问该页 | S 模式访问 U=0 的页，通过 |
+| `ppn & ((1ULL << ptshift) - 1)` | 检查大页物理地址对齐 | PPN 低 18 位为 0，通过 |
+| store 对 W 位的检查 | 确认写权限 | W=1，通过 |
+
+这里 `i=0` 表示 QEMU 循环的第一轮，对应 Sv39 的根级，也就是通常所说的 level 2。根级已经是叶子，因此直接得到一个 **1 GiB 大页映射**。Sv39 的任一级都可以出现叶子项，分别形成 1 GiB、2 MiB、4 KiB 映射。[RISC-V Sv39 规范](https://docs.riscv.org/reference/isa/priv/supervisor.html)给出了这一规则。
+
+这也与 ucore 的启动页表定义一致：`kern/init/entry.S` 将前 511 项置零，最后一项写为：
+
+```asm
+.quad (0x80000 << 10) | 0xcf
+```
+
+接着观察 A/D 位处理：
+
+```gdb
+until 291
+next
+p/x pte
+p/x updated_pte
+```
+
+相关代码为：
+
+```c
+target_ulong updated_pte = pte | PTE_A |
+    (access_type == MMU_DATA_STORE ? PTE_D : 0);
+if (updated_pte != pte) {
+    /* 原子更新页表项 */
+}
+```
+
+本次 `pte` 和 `updated_pte` 均为 `0x200000cf`，A、D 原本就已经置位，条件为假，继续使用原表项。
+
+#### 5.4 计算物理地址
+
+执行到物理页基址计算处：
+
+```gdb
+until 334
+next
+p/x addr
+p/x *physical
+p/x (addr & 0xfff)
+p/x (*physical | (addr & 0xfff))
+p i
+```
+
+代码为：
+
+```c
+target_ulong vpn = addr >> PGSHIFT;
+*physical = (ppn | (vpn & ((1L << ptshift) - 1))) << PGSHIFT;
+```
+
+本次 `ptshift=18`。根级大页的 PPN 提供高位物理页号，VPN 的低 18 位提供大页内的子页位置：
+
+```text
+vpn & ((1 << 18) - 1) = 0x203
+物理页基址 = (0x80000 | 0x203) << 12
+           = 0x80203000
+页内偏移   = 0xff8
+完整 PA    = 0x80203000 | 0xff8
+           = 0x80203ff8
+```
+
+也可以从大页映射整体计算：
+
+```text
+映射起点：VA 0xffffffffc0000000 → PA 0x80000000
+大页内偏移：0x203ff8
+最终地址：0x80000000 + 0x203ff8 = 0x80203ff8
+```
+
+![图 7：A/D 位保持不变，物理页基址与偏移组合为完整物理地址](./images/gdb/05.png)
+
+输出中的 `*physical=0x80203000` 是给软件 TLB 使用的 4 KiB 物理页基址，补上偏移后才得到此次存储的完整地址。此时 `i` 仍为 0，整个查表过程在根级完成。
+
+### 六、回填软件 TLB 并完成存储
+
+#### 6.1 观察回填参数和新表项
+
+从翻译函数返回，并进入 `tlb_set_page`：
+
+```gdb
+finish
+p/x pa
+p prot
+until 472
+step
+p/x vaddr
+p/x paddr
+p prot
+p mmu_idx
+p size
+finish
+set $fast = &cpu->neg.tlb.f[mmu_idx]
+p/x $fast->table[(address >> 12) & ($fast->mask >> 5)]
+```
+
+翻译返回成功，`prot=7`，表示 QEMU 的读、写、执行权限组合。`riscv_cpu_tlb_fill` 在后续 PMP 检查通过后调用 `tlb_set_page`：
+
+| 参数 | 值 |
+|---|---|
+| `vaddr` | `0xffffffffc0203000` |
+| `paddr` | `0x80203000` |
+| `prot` | `7` |
+| `mmu_idx` | `1` |
+| `size` | `4096` |
+
+回填后的表项为：
+
+```text
+addr_read  = 0xffffffffc0203000
+addr_write = 0xffffffffc0203000
+addr_code  = 0xffffffffc0203000
+addend     = 0x746507e00000
+```
+
+![图 8：回填参数及回填后的软件 TLB 表项](./images/gdb/06a.png)
+
+页表描述的是 1 GiB 大页，而这次回填的 `size=4096`。原因在于 QEMU 4.1.1 的 RISC-V 回填函数按 `TARGET_PAGE_SIZE` 建立当前 4 KiB 子页的缓存项，供后续快速访存使用。
+
+#### 6.2 从来宾地址得到宿主地址
+
+`tlb_set_page_with_attrs` 根据来宾物理地址找到对应内存区域，再取得宿主 RAM 指针，并在表项中保存：
+
+```text
+addend = 宿主页基址 - 来宾虚拟页基址
+```
+
+因此普通 RAM 访问命中后，可以直接通过 `addr + addend` 得到宿主指针。本次按 64 位地址算术计算：
+
+```text
+HVA = (0xffffffffc0203ff8 + 0x746507e00000) mod 2^64
+    = 0x7464c8003ff8
+```
+
+继续在 `store_helper` 中观察：
+
+```gdb
+tbreak /home/hzr/OS/qemu-4.1.1/accel/tcg/cputlb.c:1608
+continue
+p/x addr
+p/x entry->addend
+p/x haddr
+p/x val
+until 1630
+next
+x/gx haddr
+```
+
+实测 `haddr=0x7464c8003ff8`、`val=0x80000a02`。单步执行 `stq_le_p(haddr, val)` 后，该地址的 8 字节内容变为 `0x0000000080000a02`。
+
+![图 9：慢路径算出宿主地址并实际写入 ra](./images/gdb/06b.png)
+
+在终端 2 执行 `continue`，终端 3 的 `si` 返回。检查来宾结果：
+
+```gdb
+info registers pc
+x/gx 0xffffffffc0203ff8
+```
+
+得到 `pc=0xffffffffc02000f0`，目标内存中为 `0x0000000080000a02`。
+
+![图 10：来宾侧确认存储完成](./images/gdb/06c.png)
+
+两侧观察对应同一次写入：来宾通过高虚拟地址看到保存的 `ra`，QEMU 则通过宿主 RAM 指针完成了这次操作。目标指令实际采用 RISC-V 压缩编码，因此执行后 PC 前进 2 字节。
+
+### 七、重复访存，观察 TLB 命中的快速路径
+
+#### 7.1 重放同一条 store
+
+首次存储完成后，在终端 3 将 PC 恢复到目标指令，保持 `sp`、`ra` 不变：
+
+```gdb
+set $pc = 0xffffffffc02000ee
+x/i $pc
+info registers sp ra
+```
+
+在终端 2 按 Ctrl-C，设置按来宾 PC 过滤的临时断点：
+
+```gdb
+tbreak cpu_tb_exec if itb->pc == 0xffffffffc02000ee
+continue
+```
+
+回到终端 3 执行 `si`，终端 2 停在准备执行该指令所在翻译块的位置。
+
+#### 7.2 查看 TCG 生成的宿主指令
+
+在终端 2 取得翻译块的宿主代码地址：
+
+```gdb
+p/x itb->pc
+set $code_start = itb->tc.ptr
+p/x $code_start
+disassemble /r $code_start, $code_start+100
+```
+
+结果为：
+
+```text
+itb->pc     = 0xffffffffc02000ee
+$code_start = 0x7464d5600100
+```
+
+![图 11：目标 store 对应的 x86 宿主代码](./images/gdb/07a.png)
+
+其中 TLB 查询和写入的关键片段为：
+
+```asm
+0x7464d5600117: mov %rbx,%rdi
+0x7464d560011a: shr $0x7,%rdi
+0x7464d560011e: and -0x40(%rbp),%rdi
+0x7464d5600122: add -0x38(%rbp),%rdi
+0x7464d5600126: lea 0x7(%rbx),%rsi
+0x7464d560012a: and $0xfffffffffffff000,%rsi
+0x7464d5600131: cmp 0x8(%rdi),%rsi
+0x7464d5600135: mov %rbx,%rsi
+0x7464d5600138: jne 0x7464d560016a
+0x7464d560013e: add 0x18(%rdi),%rsi
+0x7464d5600142: mov %r12,(%rsi)
+```
+
+进入该片段时，`rbx` 保存来宾访问地址，`r12` 保存待写入的 `ra`。前四条指令通过移位、掩码和表基址定位 TLB 项，结果保存在 `rdi`。这里每项占 32 字节，移位量为 `12-5=7`，配合掩码直接形成表内字节偏移。
+
+`lea 0x7(%rbx),%rsi` 考虑 8 字节访问的最后一个字节，再取其页地址，用于检查整次访问是否能走同一页的快速路径。`cmp` 将它与表项偏移 8 处的 `addr_write` 比较。若不匹配，`jne` 跳转到慢路径；匹配则继续加上表项偏移 24 处的 `addend`，直接进行宿主存储。
+
+#### 7.3 单步确认比较结果和分支去向
+
+在本次生成代码的比较指令处设置临时断点：
+
+```gdb
+tbreak *0x7464d5600131
+continue
+p/x $rsi
+x/gx ($rdi+8)
+si
+p ($eflags >> 6) & 1
+si
+si
+p/x $pc
+x/3i $pc
+```
+
+观察到：
+
+```text
+比较值 RSI           = 0xffffffffc0203000
+表项 addr_write      = 0xffffffffc0203000
+cmp 后 ZF            = 1
+执行 jne 后 PC       = 0x7464d560013e
+```
+
+两个标签相等，`cmp` 设置 ZF=1。中间的 `mov` 保留标志位，随后 `jne` 不跳转，执行落在紧接着的 `add` 上。
+
+![图 12：标签相等、ZF=1，jne 走命中的顺序路径](./images/gdb/07b.png)
+
+继续执行 `add` 和存储指令：
+
+```gdb
+si
+p/x $rsi
+p/x $r12
+si
+p/x $pc
+x/gx $rsi
+```
+
+结果为：
+
+```text
+add 后 RSI = 0x7464c8003ff8
+R12        = 0x80000a02
+mov 后 PC  = 0x7464d5600145
+内存内容   = 0x0000000080000a02
+```
+
+![图 13：命中路径通过 add 和 mov 完成宿主写入](./images/gdb/07c.png)
+
+恢复终端 2 后，终端 3 再次返回到 `0xffffffffc02000f0`，栈中仍保存 `0x80000a02`。
+
+![图 14：来宾侧重放同一指令及执行结果](./images/gdb/07d.png)
+
+#### 7.4 C 查询代码与生成代码的关系
+
+本实验观察到了两种实现位置：`store_helper` 中的 C 函数 `tlb_hit`，以及 `code_gen_buffer` 中执行的 x86 标签比较。
+
+这两者通过 TCG 的翻译与执行过程联系起来：
+
+```text
+翻译阶段：
+RISC-V 存储指令译码
+  → 生成 TCG qemu_st 操作
+  → x86 后端 tcg_out_qemu_st
+  → tcg_out_tlb_load 生成 TLB 查询、比较和分支
+  → 生成宿主写入指令与慢路径 helper 调用
+
+执行阶段：
+运行已生成的宿主代码
+  → TLB 标签匹配：add + mov，直接访问 RAM
+  → 标签不匹配或需要特殊处理：进入 C helper
+```
+
+因此，在 `tcg_out_tlb_load` 中看到的是查询代码的生成；在本次 `cmp` 和 `jne` 处单步，看到的才是这次访存实际进行的 TLB 查询。首次未命中时执行 C 慢路径完成查表，重复访问则在生成的机器码中直接完成。
+
+### 八、Bare 模式下的访存对照
+
+#### 8.1 在分页开启前选择存储指令
+
+完成 Sv39 实验后重新启动 QEMU，在终端 2 附加新进程，并设置条件断点：
+
+```gdb
+break riscv_cpu_tlb_fill if address == 0x80205000 && access_type == 1
+continue
+```
+
+终端 3 重新连接后，停在保存 hart ID 的指令：
+
+```gdb
+target remote 127.0.0.1:1234
+hbreak *0x80200008
+continue
+x/i $pc
+info registers pc t0 a0 satp
+```
+
+观察到：
+
+```text
+pc   = 0x80200008
+指令 = sd a0,0(t0)
+t0   = 0x80205000
+a0   = 0
+satp = 0
+```
+
+这条指令将 hart ID 0 写入 `boot_hartid`，此时 `satp=0`，地址转换模式为 Bare。
+
+![图 15：Bare 模式下的目标存储指令](./images/gdb/08a.png)
+
+#### 8.2 观察恒等转换分支
+
+在终端 3 执行 `si`，终端 2 命中 `riscv_cpu_tlb_fill`。检查调用栈并进入翻译函数：
+
+```gdb
+bt 8
+tbreak get_physical_address
+continue
+p/x env->satp
+until 197
+p vm
+next
+p/x addr
+p/x *physical
+```
+
+调用栈仍包含 `helper_le_stq_mmu → store_helper → tlb_fill → riscv_cpu_tlb_fill`。进入 `get_physical_address` 后，`vm=0`，执行 Bare 分支：
+
+```c
+case VM_1_10_MBARE:
+    *physical = addr;
+    *prot = PAGE_READ | PAGE_WRITE | PAGE_EXEC;
+    return TRANSLATE_SUCCESS;
+```
+
+执行赋值后，`addr` 和 `*physical` 均为 `0x80205000`。这条路径直接采用原地址作为来宾物理地址。
+
+![图 16：Bare 分支直接执行 physical=addr](./images/gdb/08b.png)
+
+#### 8.3 Bare 模式仍然回填软件 TLB
+
+继续执行到回填位置：
+
+```gdb
+next
+p *prot
+finish
+p/x pa
+until 472
+step
+p/x vaddr
+p/x paddr
+p prot
+p mmu_idx
+p size
+```
+
+观察到：
+
+```text
+vaddr   = 0x80205000
+paddr   = 0x80205000
+prot    = 7
+mmu_idx = 1
+size    = 4096
+```
+
+![图 17：Bare 恒等转换后仍调用 tlb_set_page](./images/gdb/08c.png)
+
+Sv39 和 Bare 在 `get_physical_address` 中采用不同的转换分支，但成功返回后都会执行 `tlb_set_page`。即使来宾地址等于物理地址，QEMU 仍需找到它在宿主进程中对应的 RAM 或设备区域，这些信息同样可以用软件 TLB 缓存。
+
+### 九、QEMU 软件 TLB 与真实 CPU TLB 的逻辑区别
+
+| 比较项 | 真实 CPU 的地址翻译 TLB | QEMU 4.1.1 的软件 TLB |
+|---|---|---|
+| 核心作用 | 缓存虚拟页到物理页的地址转换及权限信息 | 加速来宾访存，并连接到宿主 RAM 或设备访问处理 |
+| 命中后的寻址 | 组合物理页号与页内偏移，发起物理访存 | 普通 RAM 通过 `guest_addr + addend` 得到宿主虚拟地址 |
+| Bare 模式 | 体系结构上直接以访问地址作为物理地址 | 仍使用软件 TLB，缓存恒等来宾映射及宿主访存信息 |
+| 条目内容 | 由硬件实现组织地址标签、物理页号、权限等 | 包含 `addr_read`、`addr_write`、`addr_code`、`addend` 等字段 |
+| 查询实现 | 由硬件进行匹配，结构取决于具体处理器 | 主表索引与标签比较、8 项 victim 表，以及 TCG 生成的快速路径 |
+| 本次大页处理 | Sv39 根级叶子描述 1 GiB 映射 | 从大页映射中取出当前 4 KiB 子页，按 4096 字节回填 |
+
+Bare 对照揭示了软件 TLB 的另一层用途：除了缓存来宾地址转换，它还缓存“如何在宿主中完成这次访问”。这也解释了为什么调试时会同时出现 GVA、GPA、HVA 三种地址，以及为什么页表翻译完成后还需要计算 `addend`。
+
+### 十、调试过程中的现象与学习收获
+
+**1. 外层暂停会让内层连接超时。** 最初终端 2 已附加 QEMU，但停在 GDB 提示符；终端 3 连接后出现 `timeout`，随后设置 `hbreak` 又提示目标不支持硬件断点。让终端 2 `continue` 并在终端 3 重新连接后，能读到 `pc=0x1000`，硬件断点也成功建立。由此理解了 QEMU 进程、GDB stub 与来宾 CPU 的运行关系。
+
+**2. 三级页表在本次只循环了一轮。** `levels=3` 给出最大遍历深度，而是否继续由当前 PTE 的性质决定。本次 `i=0`、`idx=511`、`pte=0x200000cf`，根项的 R/W/X 已经表明它是叶子。结合启动页表定义，可以把“1 GiB 大页”对应到实际读出的那个 8 字节表项。
+
+**3. 指针的地址与指针指向的数值不同。** 计算完整物理地址时，曾输入 `&physical | (addr & 0xfff)`，GDB 报类型错误。`physical` 是输出参数指针，`*physical` 才是翻译得到的物理页基址；改为 `*physical | (addr & 0xfff)` 后得到 `0x80203ff8`。
+
+**4. 一条来宾指令可以对应多条宿主指令。** 来宾执行的是 `sd ra,8(sp)`，宿主却需要先定位 TLB、比较标签、选择分支、计算 RAM 指针，再执行 `mov`。命中时的 `ZF=1` 和 `jne` 顺序执行，让“TLB 命中”成为可以逐条观察的机器指令行为。
+
+**5. 地址翻译成功与实际写入是两个连续步骤。** `get_physical_address` 给出物理页基址，`tlb_set_page` 建立缓存，`stq_le_p` 或生成代码中的 `mov` 才完成写入。最终在来宾地址与宿主地址读到相同的 `0x80000a02`，把整个过程连接起来。
+
+**6. 大模型帮助建立了可操作的学习路径。** 调试时先让模型根据 QEMU 版本定位相关函数，再围绕具体输出追问 `mmu_idx`、页表循环、大页 PPN 组合和 TCG 快速路径。每次问题都对应下一组断点或变量检查：从 `tlb_hit=false` 走到页表项，从 `i=0` 解释大页，再从宿主 `cmp/jne` 解释命中。阅读源码、推导地址和实际单步在这一过程中相互补充。
 
 ---
 
