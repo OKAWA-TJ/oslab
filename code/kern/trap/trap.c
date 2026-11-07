@@ -6,10 +6,13 @@
 #include <memlayout.h>
 #include <mmu.h>
 #include <riscv.h>
+#include <sbi.h>
 #include <stdio.h>
 #include <trap.h>
 
 #define TICK_NUM 100
+// 累计打印 "100 ticks"（每秒一行）的次数达到该值后，调用 sbi_shutdown() 关机。
+#define SHUTDOWN_AFTER 10
 
 static void print_ticks() {
     cprintf("%d ticks\n", TICK_NUM);
@@ -81,16 +84,101 @@ void print_regs(struct pushregs *gpr) {
 }
 
 //lab3 function2 YOUR CODE
-// TODO(lab3 function2): 按实验要求补全中断/异常分发：
-//   interrupt_handler - 处理时钟中断(IRQ_S_TIMER)、软件中断(IRQ_S_SOFT)等
-//   exception_handler - 处理断点(breakpoint)、非法指令等异常
-// 下面仅为占位实现，保证工程可编译，请替换为你的实现。
-void interrupt_handler(struct trapframe *tf) {
-    (void)tf;
+// 根据 RISC-V 指令编码判断指令长度（字节数）：
+//   最低 2 位 == 0b11  -> 32 位指令（4 字节）
+//   否则              -> 16 位压缩指令（2 字节）
+// 异常处理返回前必须跳过触发异常的那条指令，而非法指令/断点既可能是
+// 4 字节指令也可能是 2 字节压缩指令（如 c.ebreak），因此不能一律 +4，
+// 需要读取指令内容按编码动态判断。
+static inline uintptr_t instruction_length(uintptr_t epc) {
+    uint16_t instr = *(volatile uint16_t *)epc;
+    return (instr & 0x3) == 0x3 ? 4 : 2;
 }
 
+/* interrupt_handler - 处理中断（scause 最高位为 1）。
+ * 时钟中断需要：续设下一次时钟事件 + 计数 + 定期输出统计 + 达到次数后关机；
+ * 其余中断只做基本类型区分并打印提示，无法识别的中断 dump 完整 trapframe。
+ */
+void interrupt_handler(struct trapframe *tf) {
+    // scause 的 bit63 是「中断/异常」标志位，低 63 位才是中断编号；
+    // 用算术移位（左移丢掉 bit63，再右移）得到纯净的中断编号 cause。
+    intptr_t cause = (tf->cause << 1) >> 1;
+
+    switch (cause) {
+        case IRQ_U_SOFT:  // 0 用户态软件中断
+            cprintf("User software interrupt\n");
+            break;
+        case IRQ_S_SOFT:  // 1 S 态软件中断
+            cprintf("Supervisor software interrupt\n");
+            break;
+        case IRQ_H_SOFT:  // 2 H 态软件中断
+            cprintf("Hypervisor software interrupt\n");
+            break;
+        case IRQ_M_SOFT:  // 3 M 态软件中断
+            cprintf("Machine software interrupt\n");
+            break;
+        case IRQ_U_TIMER: // 4 用户态定时器中断
+            cprintf("User timer interrupt\n");
+            break;
+        case IRQ_S_TIMER: // 5 S 态定时器中断（时钟中断）
+            // 1) 立即设置下一次时钟事件，否则时钟中断只会触发一次
+            clock_set_next_event();
+            // 2) 累加时钟中断计数
+            ticks++;
+            // 3) 每 TICK_NUM(100) 次（约 1 秒）输出一行统计信息
+            if (ticks % TICK_NUM == 0) {
+                print_ticks();
+                // 4) 累计输出达到 SHUTDOWN_AFTER 次后关机
+                if (ticks / TICK_NUM >= SHUTDOWN_AFTER) {
+                    sbi_shutdown();
+                }
+            }
+            break;
+        case IRQ_H_TIMER: // 6 H 态定时器中断
+            cprintf("Hypervisor timer interrupt\n");
+            break;
+        case IRQ_M_TIMER: // 7 M 态定时器中断
+            cprintf("Machine timer interrupt\n");
+            break;
+        case IRQ_U_EXT:   // 8 用户态外部中断
+            cprintf("User external interrupt\n");
+            break;
+        case IRQ_S_EXT:   // 9 S 态外部中断
+            cprintf("Supervisor external interrupt\n");
+            break;
+        case IRQ_H_EXT:   // 10 H 态外部中断
+            cprintf("Hypervisor external interrupt\n");
+            break;
+        case IRQ_M_EXT:   // 11 M 态外部中断
+            cprintf("Machine external interrupt\n");
+            break;
+        default:
+            // 无法识别的中断：打印提示并 dump 完整 trapframe 辅助调试
+            cprintf("Unknown interrupt: cause %ld\n", cause);
+            print_trapframe(tf);
+            break;
+    }
+}
+
+/* exception_handler - 处理异常（scause 最高位为 0）。
+ * 非法指令与断点需要按指令长度修正 tf->epc，避免 sret 后又执行同一条指令
+ * 形成死循环；其余异常 dump 完整 trapframe 兜底。
+ */
 void exception_handler(struct trapframe *tf) {
-    (void)tf;
+    switch (tf->cause) {
+        case CAUSE_ILLEGAL_INSTRUCTION:  // 0x2 非法指令
+            cprintf("Illegal instruction at 0x%lx\n", tf->epc);
+            tf->epc += instruction_length(tf->epc);  // 跳过这条非法指令
+            break;
+        case CAUSE_BREAKPOINT:  // 0x3 断点（ebreak）
+            cprintf("Breakpoint at 0x%lx\n", tf->epc);
+            tf->epc += instruction_length(tf->epc);  // 跳过 ebreak
+            break;
+        default:
+            // 本实验不要求其它异常的恢复逻辑，dump trapframe 兜底
+            print_trapframe(tf);
+            break;
+    }
 }
 
 static inline void trap_dispatch(struct trapframe *tf) {
